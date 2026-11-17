@@ -11679,14 +11679,16 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
      tx.oncomplete=()=>resolve(result);tx.onerror=tx.onabort=()=>reject(tx.error||request.error||Error('Antrean belum tersimpan. Penyimpanan penuh atau tidak tersedia.'));
    });
  }
- async function queueAll_(){return (await queueTransaction_('readonly',store=>store.getAll()))||[]}
- async function queuePut_(item){await queueTransaction_('readwrite',store=>store.put(item));return item}
- async function queueDelete_(id){await queueTransaction_('readwrite',store=>store.delete(id));return true}
+ const memQ_=new Map(),dupNote_=new Map();let idbBroken_=false;
+ function idbFallback_(){if(idbBroken_)return;idbBroken_=true;window.toast?.('Penyimpanan antrean perangkat tidak tersedia. Antrean disimpan sementara di memori — jangan tutup halaman sebelum semua TERKIRIM.')}
+ async function queueAll_(){if(!idbBroken_){try{return (await queueTransaction_('readonly',store=>store.getAll()))||[]}catch(e){idbFallback_()}}return [...memQ_.values()]}
+ async function queuePut_(item){if(!idbBroken_){try{await queueTransaction_('readwrite',store=>store.put(item));return item}catch(e){idbFallback_()}}memQ_.set(item.queueId,item);return item}
+ async function queueDelete_(id){memQ_.delete(id);if(!idbBroken_){try{await queueTransaction_('readwrite',store=>store.delete(id))}catch(e){idbFallback_()}}return true}
  function witaDate_(date=new Date()){const p=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Makassar',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(date).reduce((o,x)=>(o[x.type]=x.value,o),{});return p.year+'-'+p.month+'-'+p.day}
  function queueId_(){const bytes=new Uint32Array(2);try{crypto.getRandomValues(bytes)}catch(e){bytes[0]=Math.random()*0xffffffff;bytes[1]=Math.random()*0xffffffff}return 'QRQ-'+Date.now().toString(36)+'-'+bytes[0].toString(36)+bytes[1].toString(36)}
  function queueStudent_(token){try{const body=String(token).split('.')[1].replace(/-/g,'+').replace(/_/g,'/'),json=decodeURIComponent(Array.from(atob(body),c=>'%'+c.charCodeAt(0).toString(16).padStart(2,'0')).join('')),p=JSON.parse(json),users=state?.data?.users||[],x=users.find(u=>String(u.id||u.ID)===String(p.id)||String(u.nisn||u.NISN).replace(/\D/g,'')===String(p.n||'').replace(/\D/g,''));return x?{id:String(x.id||x.ID||p.id),nisn:String(x.nisn||x.NISN||p.n),name:String(x.name||x.Nama||('QR '+p.n)),kelas:String(x.kelas||x.Kelas||'')}:{id:String(p.id||''),nisn:String(p.n||''),name:'QR '+String(p.n||''),kelas:''}}catch(e){return {name:'QR diterima',kelas:''}}}
- function queueTransient_(message){const s=String(message||'').toLowerCase();return !/(bukan kartu|tanda tangan|tidak ditemukan|tidak aktif|bukan kelas|pulang dapat|sabtu|minggu|lebih dari 48 jam|waktu perangkat)/.test(s)}
- function queueBackoff_(attempt){return [2000,5000,10000,30000,60000][Math.max(0,Math.min(4,attempt-1))]}
+ function queueTransient_(message){const s=String(message||'').toLowerCase();if(/(belum merespons|tidak merespons|timeout|jaringan|network|koneksi|sibuk|lock|diinisialisasi|failed to fetch|upload foto|diproses)/.test(s))return true;return !/(bukan kartu|tanda tangan|tidak ditemukan|tidak aktif|bukan kelas|pulang dapat|sabtu|minggu|lebih dari 48 jam|waktu perangkat)/.test(s)}
+ function queueBackoff_(attempt){return [2000,4000,8000,15000,30000][Math.max(0,Math.min(4,attempt-1))]}
  function queueActive_(all){const owner=queueOwner_();return all.filter(x=>x.owner===owner).sort((a,b)=>Number(a.sequence)-Number(b.sequence)||String(a.queueId).localeCompare(String(b.queueId)))}
  async function cleanupQueue_(){const cutoff=Date.now()-2*24*60*60*1000,all=queueActive_(await queueAll_());for(const x of all)if(x.status==='SUCCESS'&&Number(x.finishedAt||0)<cutoff)await queueDelete_(x.queueId)}
  async function renderQueueStats_(){
@@ -11695,7 +11697,10 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
  async function enqueueScan_(token){
    try{
      const captured=new Date(),type=document.getElementById('sidetV122ScanType')?.value||'MASUK',kelas=document.getElementById('sidetV122ScanClass')?.value||'',owner=queueOwner_(),dedupeKey=owner+'|'+witaDate_(captured)+'|'+type+'|'+token,all=await queueAll_(),prior=all.find(x=>x.dedupeKey===dedupeKey);
-     if(prior){scanner_.duplicate++;updateStats_();status_('QR ini sudah berada pada antrean atau sudah dikirim.','good');return}
+     if(prior){
+       if(prior.status==='FAILED'){prior.status='WAITING';prior.attempts=0;prior.nextAttemptAt=0;prior.lastError='';await queuePut_(prior);audio_(true);addRecent_(prior.student,'Dikirim ulang',prior.capturedLabel,true);status_('<b>'+esc_(prior.student?.name||'QR siswa')+'</b><br>Sebelumnya gagal — dimasukkan lagi ke antrean.','good',true);await renderQueueStats_();scheduleQueue_(10);return}
+       if(Date.now()-(dupNote_.get(token)||0)>5000){dupNote_.set(token,Date.now());scanner_.duplicate++;updateStats_();audio_(true);status_('<b>'+esc_(prior.student?.name||'QR siswa')+'</b><br>'+(prior.status==='SUCCESS'?'Sudah terkirim sebelumnya.':'Sudah berada pada antrean.'),'good',true)}
+       return}
      const id=queueId_(),sequence=Date.now()*1000+(++scanner_.sequence%1000),student=queueStudent_(token),item={queueId:id,scanId:id,owner,dedupeKey,sequence,token,kelas,type,capturedAt:captured.toISOString(),capturedLabel:captured.toLocaleTimeString('id-ID',{hour12:false}),student,status:'WAITING',attempts:0,nextAttemptAt:0,lastError:'',createdAt:Date.now()};
      await queuePut_(item);audio_(true);addRecent_(student,'Masuk antrean',item.capturedLabel,true);status_('<b>'+esc_(student.name||'QR siswa')+'</b><br>Masuk antrean. Silakan pindai kartu berikutnya.','good',true);await renderQueueStats_();scheduleQueue_(10);
    }catch(e){scanner_.fail++;updateStats_();audio_(false);status_('QR gagal masuk antrean: '+(e?.message||e),'bad')}
@@ -11714,7 +11719,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
        const j=await window.api('barcodeAttendance',{token:item.token,kelas:item.kelas,type:item.type,scanId:item.scanId,capturedAt:item.capturedAt}),d=j?.data||{},s=d.student||item.student||{};
        item.status='SUCCESS';item.finishedAt=Date.now();item.serverData=d;item.lastError='';await queuePut_(item);if(d.existing)scanner_.duplicate++;else scanner_.ok++;updateStats_();addRecent_(s,d.existing?'Sudah ada':'Terkirim',d.time||item.capturedLabel,true);status_('<b>'+esc_(s.name||item.student?.name||'Siswa')+'</b> · '+esc_(s.kelas||'')+'<br>'+(d.existing?'Sudah tercatat':'Berhasil dikirim')+' '+esc_(item.type)+' pukul '+esc_(d.time||item.capturedLabel||'—'),'good',true);
      }catch(e){
-       const message=String(e?.message||e),permanent=!queueTransient_(message),exhausted=item.attempts>=5;item.lastError=message;item.lastAttemptAt=Date.now();item.status=(permanent||exhausted)?'FAILED':'RETRY';item.nextAttemptAt=item.status==='RETRY'?Date.now()+queueBackoff_(item.attempts):0;if(item.status==='FAILED'){item.failedAt=Date.now();scanner_.fail++;updateStats_();audio_(false);addRecent_(item.student||{name:'QR ditolak',kelas:item.kelas},'Gagal: '+message,'',false)}await queuePut_(item);
+       const message=String(e?.message||e),permanent=!queueTransient_(message),exhausted=item.attempts>=12;item.lastError=message;item.lastAttemptAt=Date.now();item.status=(permanent||exhausted)?'FAILED':'RETRY';item.nextAttemptAt=item.status==='RETRY'?Date.now()+queueBackoff_(item.attempts):0;if(item.status==='FAILED'){item.failedAt=Date.now();scanner_.fail++;updateStats_();audio_(false);addRecent_(item.student||{name:'QR ditolak',kelas:item.kelas},'Gagal: '+message,'',false)}await queuePut_(item);
      }
      await renderQueueStats_();
    }catch(e){console.warn('Pekerja antrean QR:',e);nextDelay=1500}finally{scanner_.queueProcessing=false;scheduleQueue_(nextDelay)}
@@ -11724,7 +11729,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
  }
  window.sidetV122ShowQueue_=()=>queueModal_(false);window.sidetV122ShowFailed_=()=>queueModal_(true);
  window.sidetV122RetryFailed_=async function(){const all=queueActive_(await queueAll_()),failed=all.filter(x=>x.status==='FAILED');for(const x of failed){x.attempts=0;x.status='WAITING';x.nextAttemptAt=0;x.lastError='Menunggu pengiriman ulang manual.';await queuePut_(x)}await renderQueueStats_();scheduleQueue_(10);window.toast?.(failed.length?failed.length+' data gagal dimasukkan kembali sesuai urutan awal.':'Tidak ada data gagal.',!!failed.length)};
- window.addEventListener('online',()=>{renderQueueStats_();scheduleQueue_(10)});window.addEventListener('offline',renderQueueStats_);
+ window.addEventListener('online',async()=>{try{for(const x of queueActive_(await queueAll_()))if(x.status==='RETRY'){x.nextAttemptAt=0;await queuePut_(x)}}catch(e){}renderQueueStats_();scheduleQueue_(10)});window.addEventListener('offline',renderQueueStats_);
  async function audio_(good){
    try{
      scanner_.audio=scanner_.audio||new (window.AudioContext||window.webkitAudioContext)();await scanner_.audio.resume();const a=scanner_.audio,n=a.currentTime,g=a.createGain(),o=a.createOscillator();
@@ -11737,23 +11742,36 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
    stopScanner_();try{
      scanner_.audio=scanner_.audio||new (window.AudioContext||window.webkitAudioContext)();
      const selected=document.getElementById('sidetV122CameraDevice')?.value||scanner_.deviceId||'',videoRules=selected?{deviceId:{exact:selected},width:{ideal:1280},height:{ideal:720}}:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}};
-     scanner_.stream=await navigator.mediaDevices.getUserMedia({video:videoRules,audio:false});
+     if(!navigator.mediaDevices?.getUserMedia)throw Error('Kamera memerlukan koneksi aman (https) dan browser yang mendukung kamera.');
+     const tries=[videoRules];if(selected)tries.push({facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}});tries.push({facingMode:{ideal:'environment'}});tries.push(true);
+     let camErr=null;for(const v of tries){try{scanner_.stream=await navigator.mediaDevices.getUserMedia({video:v,audio:false});camErr=null;break}catch(e){camErr=e;if(/NotAllowed|Permission|Security/i.test(String(e?.name)))break}}
+     if(!scanner_.stream)throw camErr||Error('Kamera tidak tersedia.');
+     scanner_.detFail=0;scanner_.empty=0;
+     scanner_.stream.getVideoTracks?.()[0]?.addEventListener?.('ended',()=>{if(scanner_.running){status_('Kamera terputus. Menyambungkan ulang…','');setTimeout(()=>{if(scanner_.running)window.sidetV122StartScanner_()},900)}});
      const v=document.getElementById('sidetV122Video');if(!v)throw Error('Panel kamera tidak ditemukan.');v.srcObject=scanner_.stream;await v.play();scanner_.running=true;scanner_.busy=false;
      const activeId=scanner_.stream.getVideoTracks?.()[0]?.getSettings?.().deviceId||selected;scanner_.deviceId=activeId||'';loadCameras_(activeId);
      document.querySelector('.sidet-v122-frame')?.removeAttribute('hidden');const hint=document.getElementById('sidetV122CameraHint');if(hint)hint.hidden=true;status_('Kamera aktif untuk '+(kelas||'Semua Kelas')+'. Arahkan QR siswa ke kotak.', '');
      if('BarcodeDetector'in window){try{scanner_.detector=new BarcodeDetector({formats:['qr_code']})}catch(e){scanner_.detector=null}}
      if(!scanner_.detector)loadVendor_('sidet-v122-jsqr-vendor','jsQR');scanner_.raf=requestAnimationFrame(scanLoop_);
-   }catch(e){stopScanner_();status_('Kamera gagal dibuka: '+(e?.message||e),'bad')}
+   }catch(e){stopScanner_();const n=String(e?.name||''),m=/NotAllowed|Permission/i.test(n)?'Izin kamera ditolak. Izinkan kamera pada pengaturan browser lalu tekan Mulai Kamera.':/NotReadable|TrackStart/i.test(n)?'Kamera sedang dipakai aplikasi/tab lain. Tutup lalu coba lagi.':/NotFound|Overconstrained/i.test(n)?'Kamera yang dipilih tidak ditemukan. Pilih sumber kamera lain.':(e?.message||String(e));status_('Kamera gagal dibuka: '+m,'bad')}
  };
  function stopScanner_(){scanner_.running=false;scanner_.busy=false;if(scanner_.raf)cancelAnimationFrame(scanner_.raf);scanner_.raf=0;(scanner_.stream?.getTracks?.()||[]).forEach(t=>t.stop());scanner_.stream=null;const v=document.getElementById('sidetV122Video');if(v)v.srcObject=null}
  window.sidetV122StopScanner_=stopScanner_;
  async function scanLoop_(now){
-   if(!scanner_.running)return;scanner_.raf=requestAnimationFrame(scanLoop_);if(scanner_.busy||now-scanner_.lastAt<80)return;scanner_.lastAt=now;
-   const video=document.getElementById('sidetV122Video');if(!video||video.readyState<2)return;let token='';
+   if(!scanner_.running)return;scanner_.raf=requestAnimationFrame(scanLoop_);
+   if(scanner_.busy||now-scanner_.lastAt<(scanner_.detector?90:140))return;scanner_.lastAt=now;
+   const video=document.getElementById('sidetV122Video');if(!video||video.readyState<2||!video.videoWidth)return;
+   scanner_.busy=true;let token='';
+   const viaJsQr=()=>{loadVendor_('sidet-v122-jsqr-vendor','jsQR');const w=Math.min(720,video.videoWidth),h=Math.round(w*video.videoHeight/video.videoWidth);scanner_.canvas=scanner_.canvas||document.createElement('canvas');if(scanner_.canvas.width!==w||scanner_.canvas.height!==h){scanner_.canvas.width=w;scanner_.canvas.height=h;scanner_.ctx=scanner_.canvas.getContext('2d',{willReadFrequently:true})}scanner_.ctx.drawImage(video,0,0,w,h);const im=scanner_.ctx.getImageData(0,0,w,h);return window.jsQR(im.data,w,h,{inversionAttempts:'attemptBoth'})?.data||''};
    try{
-     if(scanner_.detector){const found=await scanner_.detector.detect(video);token=found?.[0]?.rawValue||''}
-     else{const w=Math.min(720,video.videoWidth||640),h=Math.round(w*(video.videoHeight||480)/(video.videoWidth||640));scanner_.canvas=scanner_.canvas||document.createElement('canvas');scanner_.canvas.width=w;scanner_.canvas.height=h;scanner_.ctx=scanner_.canvas.getContext('2d',{willReadFrequently:true});scanner_.ctx.drawImage(video,0,0,w,h);const im=scanner_.ctx.getImageData(0,0,w,h);token=window.jsQR(im.data,w,h,{inversionAttempts:'dontInvert'})?.data||''}
-   }catch(e){}
+     if(scanner_.detector){
+       try{const found=await scanner_.detector.detect(video);token=found?.[0]?.rawValue||'';scanner_.detFail=0}
+       catch(e){if(++scanner_.detFail>=5)scanner_.detector=null}
+       /* BarcodeDetector kadang tidak membaca QR yang jelas: setiap 6 frame kosong dicoba dengan jsQR. */
+       if(!token&&scanner_.detector&&(++scanner_.empty%6===0)){try{token=viaJsQr()}catch(e){}}
+     }
+     if(!scanner_.detector&&!token)token=viaJsQr();
+   }catch(e){}finally{scanner_.busy=false}
    if(token&&String(token).startsWith('SIDETQR1.')){
      const key=String(token),last=scanner_.seen.get(key)||0;
      if(Date.now()-last>1800){scanner_.seen.set(key,Date.now());enqueueScan_(key)}
@@ -11780,7 +11798,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
    stopScanner_();document.querySelector('.sidet-v122-nav-scan')?.classList.remove('active');return baseGo_.apply(this,arguments);
  };
  const baseLogout_=window.logout;if(typeof baseLogout_==='function')window.logout=function(){stopScanner_();scanner_.queueEnabled=false;if(scanner_.queueTimer)clearTimeout(scanner_.queueTimer);scanner_.queueTimer=0;return baseLogout_.apply(this,arguments)};
- document.addEventListener('visibilitychange',()=>{if(document.hidden)stopScanner_()});
+ let resume_=false;document.addEventListener('visibilitychange',()=>{if(document.hidden){resume_=scanner_.running;stopScanner_()}else{if(resume_&&document.getElementById('sidetV122Video')){resume_=false;window.sidetV122StartScanner_()}scheduleQueue_(10)}});
  let queued_=false;const observer=new MutationObserver(()=>{if(queued_)return;queued_=true;requestAnimationFrame(()=>{queued_=false;ensureStudentUi_();installRoleScanNav_()})});observer.observe(document.documentElement,{childList:true,subtree:true});
  document.addEventListener('DOMContentLoaded',()=>setTimeout(()=>{ensureStudentUi_();installRoleScanNav_()},160),{once:true});setTimeout(()=>{ensureStudentUi_();installRoleScanNav_()},800);
 })();
@@ -13644,7 +13662,7 @@ setInterval(function(){try{syncSkeleton()}catch(e){}},300);
 })();
 </script>
 <style id="teacher-checklist-style">
-#tcPanel{min-width:0}#tcPanel .tc-toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:16px 0}#tcPanel .tc-scroll{overflow:auto;max-height:58vh;border:1px solid #72799a55;border-radius:12px}#tcPanel table{min-width:930px}#tcPanel th{top:0!important}#tcPanel td{vertical-align:middle}#tcPanel .tc-name{min-width:180px}#tcPanel input[type=radio],#tcPanel input[type=checkbox]{width:22px;height:22px;min-height:0;padding:0;accent-color:#21bc9a;cursor:pointer}#tcPanel .tc-choice{text-align:center;min-width:64px}#tcPanel .tc-note{min-width:160px}#tcPanel .tc-state{font-size:11px;max-width:220px;white-space:normal}#tcPanel .tc-totals{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}#tcPanel .tc-totals span{padding:7px 10px;border:1px solid #72799a55;border-radius:10px;font-size:12px}#tcNotice{min-height:42px}#tcPanel small{display:block}#tcPanel .tc-row-actions{min-width:135px}#tcPanel .tc-srv{min-width:190px}#tcPanel .tc-badge{display:inline-block;padding:3px 9px;border-radius:99px;font-size:12px;font-weight:700;border:1px solid #72799a55}#tcPanel .tc-badge.ok{color:#17a673;border-color:#17a67388}#tcPanel .tc-badge.wait{color:#c98a00;border-color:#c98a0088}#tcPanel .tc-badge.bad{color:#d33a3a;border-color:#d33a3a88}#tcPanel tr.tc-err td{background:#d33a3a1f}#tcPanel #tcSendAll{font-weight:800}@media(max-width:600px){#tcPanel .tc-toolbar{grid-template-columns:1fr}#tcPanel .tc-name{min-width:145px}}
+#tcPanel{min-width:0}#tcPanel .tc-toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:16px 0}#tcPanel .tc-scroll{overflow:auto;max-height:58vh;border:1px solid #72799a55;border-radius:12px}#tcPanel table{min-width:930px}#tcPanel th{top:0!important}#tcPanel td{vertical-align:middle}#tcPanel .tc-name{min-width:180px}#tcPanel input[type=radio],#tcPanel input[type=checkbox]{width:22px;height:22px;min-height:0;padding:0;accent-color:#21bc9a;cursor:pointer}#tcPanel .tc-choice{text-align:center;min-width:64px}#tcPanel .tc-note{min-width:160px}#tcPanel .tc-state{font-size:11px;max-width:220px;white-space:normal}#tcPanel .tc-totals{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}#tcPanel .tc-totals span{padding:7px 10px;border:1px solid #72799a55;border-radius:10px;font-size:12px}#tcNotice{min-height:42px}#tcPanel small{display:block}#tcPanel .tc-row-actions{min-width:135px}#tcPanel .tc-srv{min-width:190px}#tcPanel .tc-badge{display:inline-block;padding:3px 9px;border-radius:99px;font-size:12px;font-weight:700;border:1px solid #72799a55}#tcPanel .tc-badge.ok{color:#17a673;border-color:#17a67388}#tcPanel .tc-badge.wait{color:#c98a00;border-color:#c98a0088}#tcPanel .tc-badge.bad{color:#d33a3a;border-color:#d33a3a88}#tcPanel tr.tc-err td{background:#d33a3a1f}#tcPanel #tcSendAll{font-weight:800}#tcPanel .tc-prog{margin:10px 0 14px;padding:14px 16px;border:1px solid #72799a55;border-radius:12px;background:#fffdf7}#tcPanel .tc-prog[hidden]{display:none}#tcPanel .tc-prog-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}#tcPanel .tc-prog-head b{font-size:26px;color:#8c6726}#tcPanel .tc-prog-bar{height:12px;border-radius:99px;background:#eadfc6;overflow:hidden;margin:8px 0 6px}#tcPanel .tc-prog-bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#8c6726,#21bc9a);border-radius:99px;transition:width .35s ease}#tcPanel .tc-prog small{color:#7b715e}@media(max-width:600px){#tcPanel .tc-toolbar{grid-template-columns:1fr}#tcPanel .tc-name{min-width:145px}}
 </style>
 <script id="teacher-checklist">
 (function(){
@@ -13684,6 +13702,7 @@ function stateText(u,r){
   const lk=lockText(u);if(lk)return lk;
   if(r.status==='BELUM')return 'Belum diperiksa — tidak ikut dikirim';
   if(isSent(r))return 'Sudah tersimpan di server'+sentInfo(r);
+  if(r.pending)return 'Sedang dikirim ke server…';
   if(r.error)return 'Gagal: '+r.error;
   if(r.pending)return 'Pengiriman belum terkonfirmasi — tekan Kirim lagi (aman diulang)';
   if(r.sent&&needNote(r.sent.type))return 'Berubah sejak terkirim; catatan izin/sakit sebelumnya tetap ada di server';
@@ -13693,6 +13712,7 @@ function badge(u,r){
   if(lockText(u))return '<span class="tc-badge">🔒 Data scan</span>';
   if(r.status==='BELUM')return '<span class="tc-badge">—</span>';
   if(isSent(r))return '<span class="tc-badge ok">✔ Terkirim</span>';
+  if(r.pending)return '<span class="tc-badge wait">⏳ Mengirim…</span>';
   if(r.error)return '<span class="tc-badge bad">✖ Gagal</span>';
   return '<span class="tc-badge wait">⏳ Belum dikirim</span>';
 }
@@ -13706,7 +13726,7 @@ function renderHead(){const h=el('tcHead');if(h)h.innerHTML='<th>Nama siswa</th>
 function render(){const body=el('tcRows');if(!body)return;renderHead();const masuk=loaded.sesi==='MASUK';body.innerHTML=list.map((u,i)=>{const r=draft[uid(u)]||defaultRow(),lk=!!lockText(u),off=(sending||lk)?' disabled':'';return '<tr data-i="'+i+'"'+(r.error&&!isSent(r)?' class="tc-err"':'')+'><td class="tc-name"><b>'+E(u.name)+'</b><small>'+E(u.nisn)+'</small></td>'+Object.entries(labels()).map(([k,v])=>'<td class="tc-choice"><input type="radio" name="tc-'+i+'" value="'+k+'" '+(r.status===k&&!lk?'checked':'')+off+' aria-label="'+E(u.name+' — '+v)+'"></td>').join('')+'<td><input class="tc-note" data-note maxlength="500" value="'+E(r.note)+'"'+off+' aria-label="Catatan '+E(u.name)+'" placeholder="'+(needNote(r.status)?'Alasan wajib diisi':'')+'"></td><td class="tc-srv"><span data-badge>'+badge(u,r)+'</span><small class="tc-state" data-state>'+E(stateText(u,r))+'</small></td></tr>'}).join('');totals();filter()}
 function refreshRow(tr,u,r){tr.classList.toggle('tc-err',!!(r.error&&!isSent(r)));tr.querySelector('[data-badge]').innerHTML=badge(u,r);tr.querySelector('[data-state]').textContent=stateText(u,r);totals()}
 function filter(){const q=(el('tcSearch')?.value||'').toLowerCase();el('tcRows')?.querySelectorAll('tr').forEach(tr=>{const u=list[Number(tr.dataset.i)];tr.hidden=!String(u.name+' '+u.nisn).toLowerCase().includes(q)})}
-function invalidate(){if(sending)return;serial++;list=[];key='';loaded=null;info={};el('tcRows').innerHTML='';el('tcTotals').textContent='';updateBtn();updateAllBtn();updateHint();renderHead();notice('Filter berubah. Tekan Tampilkan siswa.');}
+function invalidate(){if(sending)return;serial++;list=[];key='';loaded=null;info={};el('tcRows').innerHTML='';el('tcTotals').textContent='';if(el('tcProg'))el('tcProg').hidden=true;updateBtn();updateAllBtn();updateHint();renderHead();notice('Filter berubah. Tekan Tampilkan siswa.');}
 async function load(){
   if(sending)return;const date=el('tcDate').value,kelas=el('tcClass').value,sesi=sesiNow();
   if(!date||!kelas)return notice('Pilih tanggal dan kelas.',true);if(date>day())return notice('Tanggal tidak boleh melewati hari ini.',true);
@@ -13733,7 +13753,22 @@ async function load(){
 }
 function downloadCSV(){if(!loaded)return notice('Tampilkan siswa terlebih dahulu.',true);const safe=v=>{let s=String(v??'');if(/^[=+\-@\t\r]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"'};const L=labels();const rows=[['Tanggal','Kelas','Sesi','NISN','Nama','Status ceklis guru','Catatan','Penyimpanan'],...list.map(u=>{const r=draft[uid(u)]||defaultRow(),lk=lockText(u);return[loaded.date,loaded.kelas,loaded.sesi==='PULANG'?'Pulang':'Masuk',u.nisn,u.name,lk?'Data scan':L[r.status],r.note,lk||(r.status==='BELUM'?'Belum diperiksa':isSent(r)?'Tersimpan di server':'Draf perangkat; belum dikirim ke server')]})];const url=URL.createObjectURL(new Blob(['\ufeff'+rows.map(r=>r.map(safe).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'})),a=document.createElement('a');a.href=url;a.download='Ceklis_'+loaded.sesi+'_'+loaded.kelas.replace(/[^a-z0-9_-]/gi,'_')+'_'+loaded.date+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}
 function friendly(e){const m=String(e&&e.message||e||'');return /Action tidak dikenal/i.test(m)?'Fitur kirim ceklis belum tersedia di server. Silakan hubungi admin.':m}
-/* SATU tombol: mengirim seluruh ceklis sesi ini yang sudah diperiksa dan belum tersimpan di server. */
+/* SATU tombol: mengirim ceklis per paket kecil, dengan progres %, coba ulang otomatis, dan verifikasi ke server.
+   Hasil dicatat PER SISWA: yang sudah berhasil tidak pernah ditandai gagal hanya karena paket lain bermasalah. */
+const BATCH=8,TRIES=3,sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const transient=e=>/tidak merespons|timeout|jaringan|network|failed to fetch|koneksi|belum merespons|belum memberi|tidak lengkap|sedang diproses|diinisialisasi/i.test(String(e&&e.message||e||''));
+function prog(done,total,ok,bad,msg){const b=el('tcProg');if(!b)return;const p=total?Math.round(done/total*100):0;b.hidden=false;b.innerHTML='<div class="tc-prog-head"><b>'+p+'%</b><span>'+done+' dari '+total+' siswa diproses · ✔ '+ok+' berhasil'+(bad?' · ✖ '+bad+' gagal':'')+'</span></div><div class="tc-prog-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+p+'"><i style="width:'+p+'%"></i></div><small>'+E(msg||'')+'</small>'}
+/* Baca ulang arsip ceklis di server: dipakai untuk memastikan data yang responsnya hilang ternyata sudah tersimpan. */
+async function verifyServer(date,kelas,sesi){
+  try{
+    if(window.sidetV1024InvalidateCache_)window.sidetV1024InvalidateCache_('teacherChecklistState');
+    const j=await window.api('teacherChecklistState',{date,kelas}),st=j&&j.data&&j.data.students;
+    if(!Array.isArray(st))return null;
+    const m=new Map();
+    st.forEach(i=>{const c=i.ck&&i.ck[sesi];if(c&&LB[sesi][c.status]){const src=sesi==='MASUK'?i.masuk:i.pulang,fromCk=!!(src&&src.source==='CEKLIS');m.set(String(i.userId),{status:c.status,jam:fromCk?src.jam:'',menit:sesi==='MASUK'&&fromCk?Number(src.late||0):0,skipped:!!(src&&src.source==='SCAN')})}});
+    return m;
+  }catch(e){return null}
+}
 async function sendAll(){
   if(sending||conflict||!loaded||!allowed())return;
   const todo=toSend(),sesi=loaded.sesi;
@@ -13746,27 +13781,76 @@ async function sendAll(){
   if(!confirm('Kirim '+todo.length+' ceklis '+(sesi==='MASUK'?'MASUK':'PULANG')+' kelas '+loaded.kelas+' tanggal '+loaded.date+' ke server?\n\n'+ringkas+'\n\n'+catatan+' Siswa yang sudah scan tidak ditimpa.'))return;
   const savedKey=key,date=loaded.date,kelas=loaded.kelas,session=me().sessionToken;
   const snaps=new Map(todo.map(u=>[uid(u),JSON.parse(JSON.stringify(draft[uid(u)]))]));
+  const same=()=>key===savedKey&&me().sessionToken===session&&!!el('tcRows');
+  const guard=e=>{e.preventDefault();e.returnValue='Pengiriman ceklis masih berjalan.';return e.returnValue};
   sending=true;todo.forEach(u=>{const r=draft[uid(u)];r.pending=true;delete r.error});
   if(!persist()){sending=false;todo.forEach(u=>{draft[uid(u)].pending=false});updateBtn();return}
-  el('tcControls').disabled=true;render();notice('Mengirim '+todo.length+' siswa ke server… jangan tutup halaman.');
+  window.addEventListener('beforeunload',guard);
+  el('tcControls').disabled=true;render();
+  const total=todo.length;let ok=0,bad=0,skip=0,failMsg='';
+  const refresh=u=>{if(!same())return;const i=list.indexOf(u),tr=el('tcRows').querySelector('tr[data-i="'+i+'"]');if(tr)refreshRow(tr,u,draft[uid(u)])};
+  const markOk=(u,x)=>{const id=uid(u),r=draft[id],s=snaps.get(id);r.pending=false;r.sent={type:s.status,late:false,reason:String(s.note||'').trim(),date,jam:x.jam||'',menit:Number(x.menit||0),skipped:!!x.skipped,at:new Date().toISOString()};delete r.error;ok++;if(x.skipped)skip++;refresh(u)};
+  const markBad=(u,msg)=>{const r=draft[uid(u)];r.pending=false;r.error=msg||'Tidak ada konfirmasi server untuk siswa ini.';bad++;refresh(u)};
+  const batches=[];for(let i=0;i<todo.length;i+=BATCH)batches.push(todo.slice(i,i+BATCH));
+  notice('Mengirim '+total+' siswa ke server dalam '+batches.length+' paket… jangan tutup halaman.');
+  prog(0,total,0,0,'Memulai pengiriman…');
   try{
-    const rows=todo.map(u=>{const s=snaps.get(uid(u));return {userId:uid(u),status:s.status,late:false,note:String(s.note||'').trim()}});
-    const res=await window.api('teacherChecklistSave',{date,kelas,sesi,rows});
-    const results=res&&res.data&&Array.isArray(res.data.results)?res.data.results:null;
-    if(!results||res.ok===false||res.data.date!==date||res.data.kelas!==kelas||res.data.sesi!==sesi)throw Error('Server belum memberi hasil yang dapat dipastikan. Tekan Kirim lagi — pengiriman ulang aman.');
-    if(key===savedKey&&me().sessionToken===session){
-      const byId=new Map();results.forEach(x=>{const k=String(x.userId);if(!byId.has(k)||x.ok)byId.set(k,x)});let ok=0,bad=0,skip=0;
-      for(const u of todo){const id=uid(u),r=draft[id],s=snaps.get(id),x=byId.get(id);r.pending=false;
-        if(x&&x.ok&&x.status===s.status){r.sent={type:s.status,late:false,reason:String(s.note||'').trim(),date,jam:x.jam||'',menit:Number(x.menit||0),skipped:!!x.skipped,at:new Date().toISOString()};delete r.error;ok++;if(x.skipped)skip++}
-        else{r.error=(x&&x.message)||'Tidak ada konfirmasi server untuk siswa ini.';bad++}}
-      persist();
-      notice(bad?(ok+' siswa tersimpan di server, '+bad+' gagal (baris merah). Perbaiki lalu tekan Kirim lagi — yang sudah tersimpan tidak dikirim ulang.'):('Semua ('+ok+' siswa) berhasil dikirim dan terkonfirmasi server.'+(skip?' '+skip+' siswa sudah scan, data scan dipakai.':'')),!!bad);
+    for(let b=0;b<batches.length;b++){
+      let pend=batches[b].slice(),lastErr='';
+      for(let attempt=1;attempt<=TRIES&&pend.length;attempt++){
+        prog(ok+bad,total,ok,bad,'Paket '+(b+1)+' dari '+batches.length+(attempt>1?' · mencoba ulang ('+attempt+'/'+TRIES+')…':'…'));
+        if(attempt>1)await sleep(1200*attempt);
+        let retry=false;
+        try{
+          const rows=pend.map(u=>{const s=snaps.get(uid(u));return {userId:uid(u),status:s.status,late:false,note:String(s.note||'').trim()}});
+          const res=await window.api('teacherChecklistSave',{date,kelas,sesi,rows});
+          const results=res&&res.data&&Array.isArray(res.data.results)?res.data.results:null;
+          if(!results)throw Error('Server belum memberi hasil yang dapat dipastikan.');
+          const byId=new Map();results.forEach(x=>{const k=String(x.userId);if(!byId.has(k)||x.ok)byId.set(k,x)});
+          const left=[];
+          for(const u of pend){const id=uid(u),x=byId.get(id),s=snaps.get(id);
+            if(x&&x.ok&&x.status===s.status)markOk(u,x);
+            else if(x&&x.ok===false&&x.message)markBad(u,String(x.message));   /* ditolak server: final, tidak diulang */
+            else left.push(u)}
+          pend=left;if(left.length){lastErr='Tidak ada konfirmasi server untuk siswa ini.';retry=true}
+        }catch(e){
+          lastErr=friendly(e);retry=transient(e);
+          /* Respons bisa hilang padahal server sudah menyimpan: cek ke server sebelum menyatakan gagal. */
+          const vm=await verifyServer(date,kelas,sesi);
+          if(vm)pend=pend.filter(u=>{const v=vm.get(uid(u));if(v&&v.status===snaps.get(uid(u)).status){markOk(u,v);return false}return true});
+          if(!retry){pend.forEach(u=>markBad(u,lastErr));pend=[]}
+        }
+        if(!same())break;
+      }
+      pend.forEach(u=>markBad(u,lastErr));
+      if(lastErr)failMsg=lastErr;
+      if(same())persist();
+      prog(ok+bad,total,ok,bad,bad?'Berlanjut ke paket berikutnya…':'Paket '+(b+1)+' selesai.');
+      if(!same())break;
     }
-  }catch(e){if(key===savedKey)notice('Pengiriman belum terkonfirmasi: '+friendly(e),true)}
-  finally{sending=false;if(el('tcControls'))el('tcControls').disabled=false;if(key===savedKey&&me().sessionToken===session)render();else updateBtn()}
+    /* Rekonsiliasi akhir: baris gagal diperiksa sekali lagi ke server agar yang sebenarnya tersimpan tidak tampil gagal. */
+    const failed=todo.filter(u=>{const r=draft[uid(u)];return r&&r.error&&!isSent(r)});
+    if(failed.length&&same()){
+      prog(ok+bad,total,ok,bad,'Memeriksa ulang '+failed.length+' siswa ke server…');
+      const vm=await verifyServer(date,kelas,sesi);
+      if(vm)for(const u of failed){const v=vm.get(uid(u));if(v&&v.status===snaps.get(uid(u)).status){bad--;markOk(u,v)}}
+    }
+    if(same()){
+      persist();prog(total,total,ok,bad,bad?'Selesai dengan '+bad+' siswa belum tersimpan.':'Semua siswa terkonfirmasi server.');
+      notice(bad?(ok+' siswa tersimpan di server, '+bad+' belum berhasil (baris merah, alasan tertera di kolom Status server). Tekan Kirim lagi — hanya yang belum tersimpan yang dikirim ulang.'):('Semua ('+ok+' siswa) berhasil dikirim dan terkonfirmasi server.'+(skip?' '+skip+' siswa sudah scan, data scan dipakai.':'')),!!bad);
+    }
+  }catch(e){
+    /* Kegagalan tak terduga: yang sudah berhasil tetap berhasil, sisanya ditandai belum terkirim. */
+    todo.forEach(u=>{const r=draft[uid(u)];if(r&&r.pending){r.pending=false;r.error='Pengiriman terhenti: '+friendly(e)}});
+    if(same()){persist();notice('Pengiriman terhenti: '+friendly(e)+' ('+ok+' siswa sudah tersimpan). Tekan Kirim lagi untuk melanjutkan sisanya.',true)}
+  }finally{
+    window.removeEventListener('beforeunload',guard);
+    sending=false;if(el('tcControls'))el('tcControls').disabled=false;
+    if(same())render();else updateBtn();
+  }
 }
 window.sidetTeacherChecklistOpen_=async function(){if(!allowed())return;if(sending)return window.toast?.('Tunggu pengiriman ceklis selesai.');window.sidetV122StopScanner_?.();window.showPage?.('teacherPage');const dash=el('teacherDashboard');let host=el('v7TeacherHost');if(!host){host=document.createElement('div');host.id='v7TeacherHost';dash.append(host)}const seq=++serial,session=me().sessionToken;loaded=null;key='';list=[];info={};
-host.innerHTML='<section id="tcPanel" class="card"><h3>Ceklis Kehadiran Kelas</h3><p class="muted" id="tcHint"></p><fieldset id="tcControls" style="border:0;padding:0;margin:0"><div class="tc-toolbar"><div><label for="tcSesi">Sesi</label><select id="tcSesi"><option value="MASUK">Ceklis Masuk (pagi)</option><option value="PULANG">Ceklis Pulang (sore)</option></select></div><div><label for="tcDate">Tanggal</label><input type="date" id="tcDate" max="'+day()+'" value="'+day()+'"></div><div><label for="tcClass">Kelas</label><select id="tcClass"><option value="">Memuat kelas…</option></select></div><div><label for="tcSearch">Cari nama / NISN</label><input id="tcSearch" placeholder="Cari siswa"></div></div><div class="actions"><button type="button" class="btn primary" id="tcLoad">Tampilkan siswa</button><button type="button" class="btn" id="tcAll">Tandai yang belum diperiksa: Hadir</button><button type="button" class="btn primary" id="tcSendAll" disabled>Kirim Semua</button><button type="button" class="btn" id="tcCSV">Unduh CSV</button></div></fieldset><div id="tcNotice" class="alert" role="status">Memuat daftar kelas…</div><div id="tcTotals" class="tc-totals"></div><div class="tc-scroll"><table><thead><tr id="tcHead"></tr></thead><tbody id="tcRows"></tbody></table></div><p class="muted">Siswa berstatus "Belum diperiksa" tidak ikut dikirim dan tidak dianggap Alfa. Mengirim ulang aman: data diperbarui, tidak ganda. Data scan siswa tidak pernah ditimpa. Draf terpisah menurut akun, tanggal, kelas, dan sesi.</p></section>';
+host.innerHTML='<section id="tcPanel" class="card"><h3>Ceklis Kehadiran Kelas</h3><p class="muted" id="tcHint"></p><fieldset id="tcControls" style="border:0;padding:0;margin:0"><div class="tc-toolbar"><div><label for="tcSesi">Sesi</label><select id="tcSesi"><option value="MASUK">Ceklis Masuk (pagi)</option><option value="PULANG">Ceklis Pulang (sore)</option></select></div><div><label for="tcDate">Tanggal</label><input type="date" id="tcDate" max="'+day()+'" value="'+day()+'"></div><div><label for="tcClass">Kelas</label><select id="tcClass"><option value="">Memuat kelas…</option></select></div><div><label for="tcSearch">Cari nama / NISN</label><input id="tcSearch" placeholder="Cari siswa"></div></div><div class="actions"><button type="button" class="btn primary" id="tcLoad">Tampilkan siswa</button><button type="button" class="btn" id="tcAll">Tandai yang belum diperiksa: Hadir</button><button type="button" class="btn primary" id="tcSendAll" disabled>Kirim Semua</button><button type="button" class="btn" id="tcCSV">Unduh CSV</button></div></fieldset><div id="tcNotice" class="alert" role="status">Memuat daftar kelas…</div><div id="tcProg" class="tc-prog" hidden aria-live="polite"></div><div id="tcTotals" class="tc-totals"></div><div class="tc-scroll"><table><thead><tr id="tcHead"></tr></thead><tbody id="tcRows"></tbody></table></div><p class="muted">Siswa berstatus "Belum diperiksa" tidak ikut dikirim dan tidak dianggap Alfa. Mengirim ulang aman: data diperbarui, tidak ganda. Data scan siswa tidak pernah ditimpa. Draf terpisah menurut akun, tanggal, kelas, dan sesi.</p></section>';
 updateHint();renderHead();
 el('tcLoad').onclick=load;el('tcDate').onchange=invalidate;el('tcClass').onchange=invalidate;el('tcSesi').onchange=invalidate;el('tcSearch').oninput=filter;el('tcCSV').onclick=downloadCSV;el('tcSendAll').onclick=sendAll;
 el('tcAll').onclick=()=>{if(!loaded||sending||conflict)return notice('Tampilkan siswa terlebih dahulu atau muat ulang draf.',true);const def=loaded.sesi==='PULANG'?'PULANG':'HADIR';for(const u of list){if(lockText(u))continue;const id=uid(u);if(!draft[id]||draft[id].status==='BELUM')draft[id]={...defaultRow(),...draft[id],status:def,updatedAt:new Date().toISOString()}}persist();render()};
